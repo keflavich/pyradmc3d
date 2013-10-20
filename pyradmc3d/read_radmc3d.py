@@ -35,7 +35,19 @@ def read_spectrum(filename='spectrum.out'):
     wav,flux = np.loadtxt(filename, skiprows=3).T
     return wav,flux
 
+def read_population_to_cube(moleculename, shape, column=0):
+    """
+    Read in a levelpop_[moleculename].dat file and reshape it to a cube
+    """
+    fn = 'levelpop_%s.dat' % moleculename
+    levels = np.loadtxt(fn, usecols=(column,), skiprows=4)
+    return levels.reshape(shape)
+
 def image(filename=None,ext=None):
+    """
+    This function was taken from Kevin's package:
+    https://github.com/Kevtron/radmc3d-py
+    """
     
     nx=0
     ny=0
@@ -142,6 +154,8 @@ class image:
 
 def readimage(file = "image.out"):
     """RADMC-3D READING FUNCTION: Read an image
+    (this module was grabbed from Marc Joos' pyradmc package and modified to work with lines a bit)
+    https://bitbucket.org/mjoos/pyradmc/src/581fe44e0bb14a02a6a9303e283d527bae109d89/read.py?at=default
     Usage:
           im = readimage(args)
     Args:
@@ -182,4 +196,144 @@ def readimage(file = "image.out"):
     #im.y       = np.linspace(-im.size_y/2,im.size_y/2,im.ny)
     data.close()
     return(im)
+
+
+def radmcimage_to_fits(imagename,
+                       fitsname,
+                       dpc=1000,
+                       arcsec=False,
+                       mas=False,
+                       restfreq=None, 
+                       vel_offset=None,
+                       radeg=None,
+                       decdeg=None,):
+    """
+    This function comes from a post by Eric Jensen on the astropy list:
+    http://mail.scipy.org/pipermail/astropy/2013-July/002630.html
+
+    Parameters
+    ----------
+    dpc: float
+        distance in pc?
+    """
+
+    import numpy as np
+    from astropy.io import fits
+    
+    cc  = 2.9979245800000e10      # Light speed             [cm/s]
+    pc  = 3.08572e18              # Parsec                  [cm]
+    im  = readimage(imagename)
+    pixdeg_x = 180.0*(im['sizepix_x']/(dpc*pc))/np.pi
+    pixdeg_y = 180.0*(im['sizepix_y']/(dpc*pc))/np.pi
+    freqhz = 1e4*cc/im['lambda']
+    image = im['image']
+
+
+    n_freq = len(freqhz)
+    # Because of the way that Python stores arrays, we need to swap around
+    # our data array before writing it, so that it is indexed in the order
+    # (freq, y, x), rather than (x, y, freq) - the last index in the Numpy
+    # array will become AXIS1 in the FITS image, and so on. 
+    if im['stokes']:
+        (nx, ny, nstokes, nfreq) = np.shape(image)
+        newimage = np.transpose(image, (3, 2, 1, 0))
+    else:
+        (nx, ny, nfreq) = np.shape(image)
+        newimage = np.transpose(image, (2, 1, 0))
+        
+    #
+    # Compute the conversion factor from erg/cm^2/s/Hz/ster to Jy/pixel
+    #
+    pixsurf_ster = pixdeg_x*pixdeg_y * (np.pi/180.)**2
+    factor = 1e+23 * pixsurf_ster
+    # And scale the image array accordingly:
+    image_in_jypix = factor * newimage
+    
+    #
+    # Make FITS header information:
+    #
+    header = fits.Header()
+    header['BTYPE'] = 'Intensity'
+    header['BSCALE'] = 1
+    header['BZERO'] = 0
+    header['BUNIT'] = 'JY/PIXEL'
+    
+    if radeg is not None:
+        header['EPOCH'] = 2000.
+        header['LONPOLE'] = 180.
+        header['CTYPE1'] = 'RA---SIN'
+        header['CRVAL1'] = radeg
+
+    # Figure out what units we are using per pixel:
+    if arcsec:
+        unit = 'arcsec'
+        multiplier = 3600.
+    elif mas:
+        unit = 'mas'
+        multiplier = 3.6e6
+    else:
+        unit = 'deg'
+        multiplier = 1
+
+    header['CDELT1'] = multiplier*pixdeg_x
+    header['CUNIT1'] = unit
+    #
+    # ...Zero point of coordinate system
+    #
+    header['CRPIX1'] = 1.0*((nx+1)/2)
+
+    if decdeg is not None:
+        header['CTYPE2'] = 'DEC--SIN'
+        header['CRVAL2'] = decdeg
+
+    header['CDELT2'] = multiplier*pixdeg_y
+    header['CUNIT2'] = unit
+    #
+    # ...Zero point of coordinate system
+    #
+    header['CRPIX2'] = 1.0* ((ny+1)/2)
+
+    # If the keyword is set for rest frequency, add that to the header as
+    # it gives a reference point for, e.g., the velocity of the frequency
+    # steps relative to some line rest frequency.  Note that even though
+    # the keyword used here is 'restfreq', the FITS standard for this
+    # field is RESTFRQ, i.e. with no second 'E'. 
+    if restfreq is not None:
+        header['RESTFRQ'] =  (float(restfreq), 'Rest frequency of this transition')
+        
+    #
+    # ...Frequency
+    #
+    #  If they have specified a velocity offset, we shift all of the
+    #  specified frequencies by that amount.  This allows, e.g., mapping a
+    #  transition of a particular CO line in radmc3d, but then accounting
+    #  for the fact that a real object might have a center-of-mass radial
+    #  velocity offset.  Note that we do *not* shift the input 'restfreq'
+    #  keyword, as that is presumed to be the real frequency of that
+    #  transition.
+    if vel_offset is not None:
+        # Assume input velocity is in km/s, so
+        # specify speed of light in those
+        # units:
+        c  = 2.9979245800000e5        # Light speed             [km/s]
+        freqhz *= (1. - vel_offset/c)
+        header['COMMENT'] = "Velocity offset of %0.2f km/s applied to model." % vel_offset
+
+    if n_freq > 1:
+        # multiple frequencies - set up the header keywords to define the
+        #    third axis as frequency
+        header['CTYPE3'] = 'FREQ'
+        header['CUNIT3'] = 'Hz'
+        header['CRPIX3'] = 1.0
+        header['CRVAL3'] = freqhz[0]
+        # Calculate the frequency step, assuming equal steps between all:
+        delta_freq = freqhz[1] - freqhz[0]
+        header['CDELT3'] = delta_freq
+    else:                # only one frequency
+        header['RESTFREQ'] = freqhz
+
+    # Make a FITS file!
+    #
+
+    fits.writeto(fitsname, image_in_jypix, header, output_verify='fix')
 
